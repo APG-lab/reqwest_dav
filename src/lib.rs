@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time;
 
 use digest_auth::{AuthContext, WwwAuthenticateHeader};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -26,7 +27,8 @@ pub struct Client {
     pub agent: reqwest::Client,
     pub host: String,
     pub auth: Auth,
-    pub digest_auth: Arc<Mutex<Option<WwwAuthenticateHeader>>>,
+    pub digest_auth: Arc<Mutex<Option<(WwwAuthenticateHeader, time::Instant)>>>,
+    pub digest_auth_lifetime: u64
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,7 @@ pub struct ClientBuilder {
     agent: Option<reqwest::Client>,
     host: Option<String>,
     auth: Option<Auth>,
+    lifetime: Option<u64>
 }
 
 impl Client {
@@ -44,7 +47,7 @@ impl Client {
             self.host.trim_end_matches("/"),
             path.trim_start_matches("/")
         ))?;
-        let mut builder = self.agent.request(method, url.as_str());
+        let mut builder = self.agent.request(method.clone (), url.as_str());
         match &self.auth {
             Auth::Anonymous => {}
             Auth::Basic(username, password) => {
@@ -52,22 +55,23 @@ impl Client {
             }
             Auth::Digest(username, password) => {
                 let mut lock = self.digest_auth.lock().await;
-                let mut digest_auth = if let Some(digest_auth) = lock.deref() {
-                    digest_auth.clone()
-                } else {
-                    let response = self.agent.get(url.as_str()).send().await?;
-                    if response.status().as_u16() == 401 {
-                        let headers = response.headers();
-                        let www_auth = headers["www-authenticate"].to_str()?;
-                        let digest_auth = digest_auth::parse(www_auth)?;
-                        *lock = Some(digest_auth);
-                        lock.clone().unwrap()
-                    } else {
-                        return Err(error(
-                            Kind::Decode,
-                            message("digest auth response code not 401"),
-                        ));
+                let mut digest_auth = if let Some((digest_auth, digest_auth_creation)) = lock.deref() {
+                    if digest_auth_creation.elapsed ().as_secs () > self.digest_auth_lifetime
+                    {
+                        let (digest_auth_new, digest_auth_creation_new) = self.refresh_auth (url.as_str ()).await?;
+                        let digest_auth_new_use = digest_auth_new.clone ();
+                        *lock = Some((digest_auth_new, digest_auth_creation_new));
+                        digest_auth_new_use
                     }
+                    else
+                    {
+                        digest_auth.clone ()
+                    }
+                } else {
+                    let (digest_auth_new, digest_auth_creation_new) = self.refresh_auth (url.as_str ()).await?;
+                    let digest_auth_new_use = digest_auth_new.clone ();
+                    *lock = Some((digest_auth_new, digest_auth_creation_new));
+                    digest_auth_new_use
                 };
                 let context = AuthContext::new(username, password, url.path());
                 builder = builder.header(
@@ -77,6 +81,26 @@ impl Client {
             }
         };
         Ok(builder)
+    }
+
+    pub async fn refresh_auth (&self, url: &str)
+        -> Result<(WwwAuthenticateHeader, time::Instant), Error>
+    {
+        let response = self.agent.get(url).send().await?;
+        if response.status().as_u16() == 401
+        {
+            let headers = response.headers();
+            let www_auth = headers["www-authenticate"].to_str()?;
+            let digest_auth = digest_auth::parse(www_auth)?;
+            Ok ((digest_auth, time::Instant::now ()))
+        }
+        else
+        {
+            Err(error(
+                Kind::Decode,
+                    message("digest auth response code not 401"),
+                ))
+        }
     }
 
     pub async fn get_raw(&self, path: &str) -> Result<Response, Error> {
@@ -308,6 +332,7 @@ impl ClientBuilder {
             agent: None,
             host: None,
             auth: None,
+            lifetime: None
         }
     }
 
@@ -323,6 +348,11 @@ impl ClientBuilder {
 
     pub fn set_auth(mut self, auth: Auth) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    pub fn set_lifetime(mut self, lifetime: u64) -> Self {
+        self.lifetime = Some(lifetime);
         self
     }
 
@@ -342,6 +372,11 @@ impl ClientBuilder {
                 Auth::Anonymous
             },
             digest_auth: Arc::new(Default::default()),
+            digest_auth_lifetime: if let Some(lifetime) = self.lifetime {
+                lifetime
+            } else {
+                290
+            }
         })
     }
 }
