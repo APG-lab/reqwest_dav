@@ -8,7 +8,7 @@ repository = "https://github.com/niuhuan/reqwest_dav"
 
 [dependencies]
 digest_auth = { git = "https://github.com/APG-lab/digest_auth" }
-reqwest = "0.11"
+reqwest = { version = "0.11", features = ["stream"] }
 url = "2.3.1"
 tokio = { version = "1.0", features = [] }
 http = "0.2"
