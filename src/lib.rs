@@ -28,7 +28,7 @@ pub struct Client {
     pub host: String,
     pub auth: Auth,
     pub digest_auth: Arc<Mutex<Option<(WwwAuthenticateHeader, time::Instant)>>>,
-    pub digest_auth_lifetime: u64
+    pub digest_auth_lifetime: Option<u64>
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ impl Client {
             Auth::Digest(username, password) => {
                 let mut lock = self.digest_auth.lock().await;
                 let mut digest_auth = if let Some((digest_auth, digest_auth_creation)) = lock.deref() {
-                    if digest_auth_creation.elapsed ().as_secs () > self.digest_auth_lifetime
+                    if self.digest_auth_lifetime.is_some () && digest_auth_creation.elapsed ().as_secs () > self.digest_auth_lifetime.unwrap ()
                     {
                         let (digest_auth_new, digest_auth_creation_new) = self.refresh_auth (url.as_str ()).await?;
                         let digest_auth_new_use = digest_auth_new.clone ();
@@ -372,11 +372,7 @@ impl ClientBuilder {
                 Auth::Anonymous
             },
             digest_auth: Arc::new(Default::default()),
-            digest_auth_lifetime: if let Some(lifetime) = self.lifetime {
-                lifetime
-            } else {
-                290
-            }
+            digest_auth_lifetime: self.lifetime
         })
     }
 }
