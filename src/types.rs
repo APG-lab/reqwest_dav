@@ -46,6 +46,30 @@ pub mod common {
         pub(crate) inner: Box<Inner>,
     }
 
+    impl Error {
+        pub fn dav_error (&self)
+        -> Option<DavError>
+        {
+            match self.inner.kind {
+                Kind::Dav => {
+                    if let Some (e) = &self.inner.source
+                    {
+                        match e.downcast_ref::<DavError> ()
+                        {
+                            Some (de) => Some (de.clone ()),
+                            _ => None
+                        }
+                    }
+                    else
+                    {
+                        None
+                    }
+                },
+                _ => None
+            }
+        }
+    }
+
     impl Debug for Error {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             let mut builder = f.debug_struct("reqwest_dav::Error");
@@ -243,7 +267,15 @@ pub mod common {
                 Ok(self)
             } else {
                 let text = self.text().await?;
-                let tmp: DavErrorTmp = serde_xml_rs::from_str(&text)?;
+                //let tmp: DavErrorTmp = serde_xml_rs::from_str(&text)?;
+                let tmp: DavErrorTmp = if text.starts_with (r#"<?xml version="1.0" encoding="utf-8"?>"#)
+                {
+                    DavErrorTmp { exception: String::from ("Error xml response"), message: text }
+                }
+                else
+                {
+                    DavErrorTmp { exception: String::from ("Error html response"), message: text }
+                };
                 Err(error(
                     Kind::Dav,
                     DavError {
@@ -350,7 +382,7 @@ pub mod list_entities {
         pub content_length: i64,
 
         #[serde(rename = "getcontenttype")]
-        pub content_type: String,
+        pub content_type: Option<String>,
 
         #[serde(rename = "getetag")]
         pub tag: String,

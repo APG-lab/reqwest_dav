@@ -73,7 +73,7 @@ impl Client {
                     *lock = Some((digest_auth_new, digest_auth_creation_new));
                     digest_auth_new_use
                 };
-                let context = AuthContext::new(username, password, url.path());
+                let context = AuthContext::new_with_method (username, password, url.path(), None::<&[u8]>, method.to_string ().into ());
                 builder = builder.header(
                     "Authorization",
                     digest_auth.respond(&context)?.to_header_string(),
@@ -84,7 +84,7 @@ impl Client {
     }
 
     pub async fn refresh_auth (&self, url: &str)
-        -> Result<(WwwAuthenticateHeader, time::Instant), Error>
+    -> Result<(WwwAuthenticateHeader, time::Instant), Error>
     {
         let response = self.agent.get(url).send().await?;
         if response.status().as_u16() == 401
@@ -294,14 +294,8 @@ impl Client {
                 ListEntity::Folder(ListFolder {
                     href: x.href,
                     last_modified: x.prop_stat.prop.last_modified,
-                    quota_used_bytes: x.prop_stat.prop.quota_used_bytes.ok_or(Message {
-                        message: "quota_used_bytes not found".to_string(),
-                    })?,
-                    quota_available_bytes: x.prop_stat.prop.quota_available_bytes.ok_or(
-                        Message {
-                            message: "quota_available_bytes not found".to_string(),
-                        },
-                    )?,
+                    quota_used_bytes: x.prop_stat.prop.quota_used_bytes.unwrap_or (-1),
+                    quota_available_bytes: x.prop_stat.prop.quota_available_bytes.unwrap_or (-1),
                     tag: x.prop_stat.prop.tag,
                 })
             } else {
@@ -317,12 +311,121 @@ impl Client {
                         .prop_stat
                         .prop
                         .content_type
-                        .ok_or(error(Kind::Decode, message("content_type not found")))?,
+                        .clone (),
                     tag: x.prop_stat.prop.tag,
                 })
             });
         }
         Ok(entities)
+    }
+
+    pub async fn get_prop_raw (&self, path: &str, props: Vec<&str>)
+        -> Result<Response, Error>
+    {
+        let props_full: Vec<String> = props.iter ().fold (vec!["getlastmodified","resourcetype","getetag"], |mut acc, item| {
+            if !acc.contains (item) { acc.push (item) };acc
+        }).iter ().map (|x| format! ("<D:{}/>", x)).collect ();
+        let body = format! (r#"<?xml version="1.0" encoding="utf-8" ?>
+            <D:propfind xmlns:D="DAV:">
+                <D:prop>
+                    {}
+                </D:prop>
+            </D:propfind>
+        "#, props_full.join ("\n"));
+        Ok(self
+            .start_request(Method::from_bytes(b"PROPFIND").unwrap(), path)
+            .await?
+            .headers({
+                let mut map = HeaderMap::new();
+                map.insert(
+                    "depth",
+                    HeaderValue::from_str("0")?,
+                );
+                map
+            })
+            .body(body)
+            .send()
+            .await?)
+    }
+
+    pub async fn get_prop_rsp (&self, path: &str, props: Vec<&str>)
+        -> Result<Vec<ListResponse>, Error>
+    {
+        let reqwest_response = self.get_prop_raw(path, props).await?;
+        if reqwest_response.status().as_u16() == 207
+        {
+            let response = reqwest_response.text().await?;
+            let mul: ListMultiStatus = serde_xml_rs::from_str(&response)?;
+            Ok(mul.responses)
+        }
+        else if reqwest_response.status().as_u16() == 404
+        {
+            Ok (Vec::new ())
+        }
+        else
+        {
+            Err(Error {
+                inner: Box::new(Inner {
+                    kind: Kind::Decode,
+                    source: Some(Box::new(Message {
+                        message: "list response code not 207 or 404".to_string(),
+                    })),
+                }),
+            })
+        }
+    }
+
+    pub async fn get_prop (&self, path: &str, props: Vec<&str>)
+        -> Result<Option<ListEntity>, Error>
+    {
+        let cmd_response = self.get_prop_rsp (path, props).await?;
+        if let Some (x) = cmd_response.first ()
+        {
+            if x.prop_stat.prop.resource_type.redirect_ref.is_some()
+                || x.prop_stat.prop.resource_type.redirect_lifetime.is_some()
+            {
+                Err(Error {
+                    inner: Box::new(Inner {
+                        kind: Kind::Decode,
+                        source: Some(Box::new(Message {
+                            message: "redirect not support".to_string(),
+                        })),
+                    }),
+                })
+            }
+            else if  x.prop_stat.prop.resource_type.collection.is_some()
+            {
+                Ok (Some (ListEntity::Folder(ListFolder {
+                    href: x.href.clone (),
+                    last_modified: x.prop_stat.prop.last_modified,
+                    quota_used_bytes: x.prop_stat.prop.quota_used_bytes.unwrap_or (-1),
+                    quota_available_bytes: x.prop_stat.prop.quota_available_bytes.unwrap_or (-1),
+                    tag: x.prop_stat.prop.tag.clone (),
+                })))
+            }
+            else
+            {
+                Ok (Some (ListEntity::File(ListFile {
+                    href: x.href.clone (),
+                    last_modified: x.prop_stat.prop.last_modified,
+                    content_length: x
+                        .prop_stat
+                        .prop
+                        .content_length
+                        .ok_or(error(Kind::Decode, message("content_length not found")))?,
+                    content_type: x
+                        .prop_stat
+                        .prop
+                        .content_type
+                        .clone (),
+                    tag: x.prop_stat.prop.tag.clone (),
+                })))
+            }
+        }
+        else
+        {
+            Ok (None)
+        }
     }
 }
 
